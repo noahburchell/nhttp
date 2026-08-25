@@ -10,11 +10,14 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PORT       80
 #define BACKLOG    64
+#define TIMEOUT    10
 #define REQ_MAX    8192
 #define IO_BUF     65536
 
@@ -75,21 +78,31 @@ static const char *mime_type(const char *path)
 	return "application/octet-stream";
 }
 
+static void http_date(char *buf, size_t n)
+{
+	time_t t = time(NULL);
+	struct tm tm;
+
+	strftime(buf, n, "%a, %d %b %Y %H:%M:%S GMT", gmtime_r(&t, &tm));
+}
+
 static void send_error(int fd, int code, const char *reason)
 {
-	char body[256], head[512];
+	char body[256], head[512], date[32];
 	int blen, hlen;
 
+	http_date(date, sizeof(date));
 	blen = snprintf(body, sizeof(body),
 		"<!doctype html><title>%d %s</title><h1>%d %s</h1>\n",
 		code, reason, code, reason);
 	hlen = snprintf(head, sizeof(head),
 		"HTTP/1.1 %d %s\r\n"
+		"Date: %s\r\n"
 		"Content-Type: text/html; charset=utf-8\r\n"
 		"Content-Length: %d\r\n"
 		"Connection: close\r\n"
 		"\r\n",
-		code, reason, blen);
+		code, reason, date, blen);
 
 	if (write_all(fd, head, hlen) == 0)
 		write_all(fd, body, blen);
@@ -133,14 +146,14 @@ static int resolve_path(const char *root, const char *urlpath,
                         char *out, size_t outsz)
 {
 	char joined[PATH_MAX], real[PATH_MAX];
-	size_t rootlen = strlen(root);
+	size_t rootlen = strcmp(root, "/") ? strlen(root) : 0;
 	struct stat st;
 	int n, pass;
 
 	if (urlpath[0] != '/')
 		return RESOLVE_FORBIDDEN;
 
-	n = snprintf(joined, sizeof(joined), "%s%s", root, urlpath);
+	n = snprintf(joined, sizeof(joined), "%.*s%s", (int)rootlen, root, urlpath);
 	if (n < 0 || (size_t)n >= sizeof(joined))
 		return RESOLVE_FORBIDDEN;
 
@@ -168,8 +181,9 @@ static int resolve_path(const char *root, const char *urlpath,
 
 static void send_file(int fd, const char *path, int head_only)
 {
-	char buf[IO_BUF], head[512];
+	char buf[IO_BUF], head[512], date[32];
 	struct stat st;
+	off_t left;
 	ssize_t r;
 	int ffd, hlen;
 
@@ -184,18 +198,26 @@ static void send_file(int fd, const char *path, int head_only)
 		return;
 	}
 
+	http_date(date, sizeof(date));
 	hlen = snprintf(head, sizeof(head),
 		"HTTP/1.1 200 OK\r\n"
+		"Date: %s\r\n"
 		"Content-Type: %s\r\n"
 		"Content-Length: %lld\r\n"
 		"Connection: close\r\n"
 		"\r\n",
-		mime_type(path), (long long)st.st_size);
+		date, mime_type(path), (long long)st.st_size);
 
-	if (write_all(fd, head, hlen) == 0 && !head_only)
-		while ((r = read(ffd, buf, sizeof(buf))) > 0)
+	if (write_all(fd, head, hlen) == 0 && !head_only) {
+		left = st.st_size;
+		while (left > 0 && (r = read(ffd, buf, sizeof(buf))) > 0) {
+			if (r > left)
+				r = left;
 			if (write_all(fd, buf, r) < 0)
 				break;
+			left -= r;
+		}
+	}
 
 	close(ffd);
 }
@@ -259,6 +281,16 @@ static void handle_conn(int cfd, const char *root)
 	}
 }
 
+static void close_conn(int fd)
+{
+	char buf[4096];
+
+	shutdown(fd, SHUT_WR);
+	while (read(fd, buf, sizeof(buf)) > 0)
+		;
+	close(fd);
+}
+
 static int listen_on(int port)
 {
 	struct sockaddr_in addr;
@@ -285,6 +317,7 @@ static int listen_on(int port)
 
 int main(int argc, char **argv)
 {
+	struct timeval tv = { TIMEOUT, 0 };
 	char root[PATH_MAX];
 	int lfd;
 
@@ -304,16 +337,27 @@ int main(int argc, char **argv)
 
 	for (;;) {
 		int cfd = accept(lfd, NULL, NULL);
+		pid_t pid;
+
 		if (cfd < 0) {
-			if (errno == EINTR)
+			if (errno == EINTR || errno == ECONNABORTED)
 				continue;
 			die("accept");
 		}
 
-		if (fork() == 0) {
+		setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+		pid = fork();
+		if (pid < 0) {
+			send_error(cfd, 503, "Service Unavailable");
+			close_conn(cfd);
+			continue;
+		}
+		if (pid == 0) {
 			close(lfd);
 			handle_conn(cfd, root);
-			close(cfd);
+			close_conn(cfd);
 			_exit(0);
 		}
 		close(cfd);

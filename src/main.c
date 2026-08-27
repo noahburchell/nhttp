@@ -12,12 +12,14 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define PORT       80
 #define BACKLOG    64
 #define TIMEOUT    10
+#define CONN_MAX   128
 #define REQ_MAX    8192
 #define IO_BUF     65536
 
@@ -37,8 +39,8 @@ static int write_all(int fd, const void *buf, size_t n)
 
 	while (n) {
 		ssize_t w = write(fd, p, n);
-		if (w < 0) {
-			if (errno == EINTR)
+		if (w <= 0) {
+			if (w < 0 && errno == EINTR)
 				continue;
 			return -1;
 		}
@@ -66,6 +68,12 @@ static const char *mime_type(const char *path)
 		{ ".ico",   "image/x-icon" },
 		{ ".woff2", "font/woff2" },
 		{ ".pdf",   "application/pdf" },
+		{ ".tar",   "application/x-tar" },
+		{ ".gz",    "application/gzip" },
+		{ ".tgz",   "application/gzip" },
+		{ ".xz",    "application/x-xz" },
+		{ ".txz",   "application/x-xz" },
+		{ ".zip",   "application/zip" },
 	};
 	const char *base = strrchr(path, '/');
 	const char *ext = strrchr(base ? base : path, '.');
@@ -83,12 +91,14 @@ static void http_date(char *buf, size_t n)
 	time_t t = time(NULL);
 	struct tm tm;
 
-	strftime(buf, n, "%a, %d %b %Y %H:%M:%S GMT", gmtime_r(&t, &tm));
+	if (!gmtime_r(&t, &tm) ||
+	    !strftime(buf, n, "%a, %d %b %Y %H:%M:%S GMT", &tm))
+		*buf = '\0';
 }
 
-static void send_error(int fd, int code, const char *reason)
+static void send_error(int fd, int code, const char *reason, int head_only)
 {
-	char body[256], head[512], date[32];
+	char body[256], head[512], date[64];
 	int blen, hlen;
 
 	http_date(date, sizeof(date));
@@ -100,11 +110,16 @@ static void send_error(int fd, int code, const char *reason)
 		"Date: %s\r\n"
 		"Content-Type: text/html; charset=utf-8\r\n"
 		"Content-Length: %d\r\n"
+		"%s"
 		"Connection: close\r\n"
 		"\r\n",
-		code, reason, date, blen);
+		code, reason, date, blen,
+		code == 405 ? "Allow: GET, HEAD\r\n" : "");
 
-	if (write_all(fd, head, hlen) == 0)
+	if (blen < 0 || (size_t)blen >= sizeof(body) ||
+	    hlen < 0 || (size_t)hlen >= sizeof(head))
+		return;
+	if (write_all(fd, head, hlen) == 0 && !head_only)
 		write_all(fd, body, blen);
 }
 
@@ -136,7 +151,7 @@ static int url_decode(const char *src, char *dst, size_t dstsz)
 		}
 		if (c == '\0' || i + 1 >= dstsz)
 			return -1;
-		dst[i++] = c;
+		dst[i++] = (char)c;
 	}
 	dst[i] = '\0';
 	return 0;
@@ -181,20 +196,20 @@ static int resolve_path(const char *root, const char *urlpath,
 
 static void send_file(int fd, const char *path, int head_only)
 {
-	char buf[IO_BUF], head[512], date[32];
+	char buf[IO_BUF], head[512], date[64];
 	struct stat st;
 	off_t left;
 	ssize_t r;
 	int ffd, hlen;
 
-	ffd = open(path, O_RDONLY);
+	ffd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
 	if (ffd < 0) {
-		send_error(fd, 403, "Forbidden");
+		send_error(fd, 403, "Forbidden", head_only);
 		return;
 	}
 	if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode)) {
 		close(ffd);
-		send_error(fd, 403, "Forbidden");
+		send_error(fd, 403, "Forbidden", head_only);
 		return;
 	}
 
@@ -208,11 +223,27 @@ static void send_file(int fd, const char *path, int head_only)
 		"\r\n",
 		date, mime_type(path), (long long)st.st_size);
 
+	if (hlen < 0 || (size_t)hlen >= sizeof(head)) {
+		close(ffd);
+		send_error(fd, 500, "Internal Server Error", head_only);
+		return;
+	}
+
 	if (write_all(fd, head, hlen) == 0 && !head_only) {
 		left = st.st_size;
-		while (left > 0 && (r = read(ffd, buf, sizeof(buf))) > 0) {
-			if (r > left)
-				r = left;
+		while (left > 0) {
+			size_t want = sizeof(buf);
+
+			if ((off_t)want > left)
+				want = (size_t)left;
+			r = read(ffd, buf, want);
+			if (r < 0) {
+				if (errno == EINTR)
+					continue;
+				break;
+			}
+			if (r == 0)
+				break;
 			if (write_all(fd, buf, r) < 0)
 				break;
 			left -= r;
@@ -230,42 +261,55 @@ static void handle_conn(int cfd, const char *root)
 	ssize_t r;
 	int head_only;
 
-	while (len < sizeof(req) - 1) {
-		r = read(cfd, req + len, sizeof(req) - 1 - len);
-		if (r < 0 && errno == EINTR)
-			continue;
-		if (r <= 0)
+	alarm(TIMEOUT);
+
+	for (;;) {
+		if (len == sizeof(req) - 1) {
+			send_error(cfd, 431, "Request Header Fields Too Large", 0);
 			return;
+		}
+		r = read(cfd, req + len, sizeof(req) - 1 - len);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return;
+		}
+		if (r == 0) {
+			if (len)
+				send_error(cfd, 400, "Bad Request", 0);
+			return;
+		}
 		len += r;
 		req[len] = '\0';
-		if (strstr(req, "\r\n\r\n"))
+		if (strstr(req, "\r\n\r\n") || strstr(req, "\n\n"))
 			break;
 	}
-	req[len] = '\0';
+
+	alarm(0);
 
 	method = req;
 	sp = strchr(req, ' ');
 	if (!sp) {
-		send_error(cfd, 400, "Bad Request");
+		send_error(cfd, 400, "Bad Request", 0);
 		return;
 	}
 	*sp = '\0';
 	target = sp + 1;
 	sp = strchr(target, ' ');
 	if (!sp) {
-		send_error(cfd, 400, "Bad Request");
+		send_error(cfd, 400, "Bad Request", 0);
 		return;
 	}
 	*sp = '\0';
 
 	head_only = !strcmp(method, "HEAD");
 	if (!head_only && strcmp(method, "GET")) {
-		send_error(cfd, 405, "Method Not Allowed");
+		send_error(cfd, 405, "Method Not Allowed", 0);
 		return;
 	}
 
 	if (url_decode(target, path, sizeof(path)) < 0) {
-		send_error(cfd, 400, "Bad Request");
+		send_error(cfd, 400, "Bad Request", head_only);
 		return;
 	}
 
@@ -274,10 +318,10 @@ static void handle_conn(int cfd, const char *root)
 		send_file(cfd, file, head_only);
 		break;
 	case RESOLVE_FORBIDDEN:
-		send_error(cfd, 403, "Forbidden");
+		send_error(cfd, 403, "Forbidden", head_only);
 		break;
 	default:
-		send_error(cfd, 404, "Not Found");
+		send_error(cfd, 404, "Not Found", head_only);
 	}
 }
 
@@ -285,10 +329,26 @@ static void close_conn(int fd)
 {
 	char buf[4096];
 
+	alarm(TIMEOUT);
 	shutdown(fd, SHUT_WR);
 	while (read(fd, buf, sizeof(buf)) > 0)
 		;
 	close(fd);
+}
+
+static int reap(int nchild, int block)
+{
+	while (nchild > 0) {
+		pid_t p = waitpid(-1, NULL, block ? 0 : WNOHANG);
+
+		if (p < 0 && errno == ECHILD)
+			return 0;
+		if (p <= 0)
+			break;
+		nchild--;
+		block = 0;
+	}
+	return nchild;
 }
 
 static int listen_on(int port)
@@ -319,18 +379,24 @@ int main(int argc, char **argv)
 {
 	struct timeval tv = { TIMEOUT, 0 };
 	char root[PATH_MAX];
-	int lfd;
+	struct stat st;
+	int lfd, nchild = 0;
 
 	if (argc != 2) {
-		fprintf(stderr, "usage: %s <docroot>\n", argv[0]);
+		fprintf(stderr, "usage: %s <docroot>\n", argc ? argv[0] : "nhttp");
 		return 1;
 	}
 
 	signal(SIGPIPE, SIG_IGN);
-	signal(SIGCHLD, SIG_IGN);
 
 	if (!realpath(argv[1], root))
 		die(argv[1]);
+	if (stat(root, &st) < 0)
+		die(root);
+	if (!S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "nhttp: %s: not a directory\n", root);
+		return 1;
+	}
 
 	lfd = listen_on(PORT);
 	fprintf(stderr, "nhttp: serving %s on port %d\n", root, PORT);
@@ -342,16 +408,28 @@ int main(int argc, char **argv)
 		if (cfd < 0) {
 			if (errno == EINTR || errno == ECONNABORTED)
 				continue;
+			if (errno == EMFILE || errno == ENFILE ||
+			    errno == ENOBUFS || errno == ENOMEM) {
+				if (nchild)
+					nchild = reap(nchild, 1);
+				else
+					sleep(1);
+				continue;
+			}
 			die("accept");
 		}
 
 		setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 		setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+		nchild = reap(nchild, 0);
+		if (nchild >= CONN_MAX)
+			nchild = reap(nchild, 1);
+
 		pid = fork();
 		if (pid < 0) {
-			send_error(cfd, 503, "Service Unavailable");
-			close_conn(cfd);
+			send_error(cfd, 503, "Service Unavailable", 0);
+			close(cfd);
 			continue;
 		}
 		if (pid == 0) {
@@ -360,6 +438,7 @@ int main(int argc, char **argv)
 			close_conn(cfd);
 			_exit(0);
 		}
+		nchild++;
 		close(cfd);
 	}
 }

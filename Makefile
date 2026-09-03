@@ -21,7 +21,7 @@ WARN := -Wall -Wextra -Wpedantic \
 	-Wstrict-prototypes -Wold-style-definition -Wmissing-prototypes \
 	-Wmissing-declarations -Wmissing-include-dirs -Wnested-externs \
 	-Wredundant-decls -Wunused-macros -Winit-self \
-	-Wswitch-enum -Wswitch-default -Wimplicit-fallthrough=5 \
+	-Wswitch-enum -Wimplicit-fallthrough=5 \
 	-Wduplicated-cond -Wduplicated-branches -Wlogical-op \
 	-Wjump-misses-init -Wnull-dereference -Wtrampolines \
 	-Wdisabled-optimization -Wstack-protector -Woverlength-strings

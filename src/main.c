@@ -1,58 +1,70 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-#define PORT       80
-#define BACKLOG    64
-#define TIMEOUT    10
-#define CONN_MAX   128
-#define REQ_MAX    8192
-#define IO_BUF     65536
+#define USER     "nhttp"
+#define PORT     80
+#define BACKLOG  64
+#define TIMEOUT  10
+#define CONN_MAX 128
+#define REQ_MAX  8192
+#define INDEX    "/index.html"
 
-#define RESOLVE_OK        0
-#define RESOLVE_FORBIDDEN -1
-#define RESOLVE_NOTFOUND  -2
-
-static void die(const char *msg)
-{
-	perror(msg);
+[[noreturn]] static void die(const char* call, const char* obj) {
+	fprintf(stderr, "nhttp: %s%s%s: %s\n", call, obj ? " " : "", obj ? obj : "", strerror(errno));
 	exit(1);
 }
 
-static int write_all(int fd, const void *buf, size_t n)
-{
-	const char *p = buf;
+static void usage(FILE* f) {
+	fputs("usage: nhttp DIR\n"
+	      "\n"
+	      "      --help display this help and exit\n"
+	      "\n"
+	      "DIR is served on port 80 as the document root\n"
+	      "must be run as root " USER "\n",
+	      f);
+}
 
-	while (n) {
-		ssize_t w = write(fd, p, n);
-		if (w <= 0) {
-			if (w < 0 && errno == EINTR)
-				continue;
-			return -1;
+static int write_all(int fd, const void* buf, size_t n, bool more) {
+	const char* p = buf;
+
+	while(n) {
+		ssize_t k = send(fd, p, n, more ? MSG_MORE : 0);
+
+		if(k > 0) {
+			p += k;
+			n -= (size_t)k;
+			continue;
 		}
-		p += w;
-		n -= w;
+
+		if(k < 0 && errno == EINTR) {
+			continue;
+		}
+
+		return -1;
 	}
+
 	return 0;
 }
 
-static const char *mime_type(const char *path)
-{
-	static const char *const tab[][2] = {
+static const char* mime_type(const char* path) {
+	static const char* const tab[][2] = {
 		{ ".html",  "text/html; charset=utf-8" },
 		{ ".htm",   "text/html; charset=utf-8" },
 		{ ".css",   "text/css; charset=utf-8" },
@@ -75,369 +87,410 @@ static const char *mime_type(const char *path)
 		{ ".txz",   "application/x-xz" },
 		{ ".zip",   "application/zip" },
 	};
-	const char *base = strrchr(path, '/');
-	const char *ext = strrchr(base ? base : path, '.');
+	const char* ext = strrchr(path, '.');
 	size_t i;
 
-	if (ext)
-		for (i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
-			if (!strcasecmp(ext, tab[i][0]))
+	if(ext && !strchr(ext, '/')) {
+		for(i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
+			if(!strcasecmp(ext, tab[i][0])) {
 				return tab[i][1];
+			}
+		}
+	}
+
 	return "application/octet-stream";
 }
 
-static void http_date(char *buf, size_t n)
-{
-	time_t t = time(NULL);
+static void http_date(char* buf, size_t n) {
+	time_t t = time(nullptr);
 	struct tm tm;
 
-	if (!gmtime_r(&t, &tm) ||
-	    !strftime(buf, n, "%a, %d %b %Y %H:%M:%S GMT", &tm))
+	if(!gmtime_r(&t, &tm) || !strftime(buf, n, "%a, %d %b %Y %H:%M:%S GMT", &tm)) {
 		*buf = '\0';
+	}
 }
 
-static void send_error(int fd, int code, const char *reason, int head_only)
-{
+static void send_error(int fd, int code, const char* reason, bool head_only) {
 	char body[256], head[512], date[64];
 	int blen, hlen;
 
 	http_date(date, sizeof(date));
-	blen = snprintf(body, sizeof(body),
-		"<!doctype html><title>%d %s</title><h1>%d %s</h1>\n",
-		code, reason, code, reason);
+	blen = snprintf(body, sizeof(body), "<!doctype html><title>%d %s</title><h1>%d %s</h1>\n",
+	                code, reason, code, reason);
 	hlen = snprintf(head, sizeof(head),
-		"HTTP/1.1 %d %s\r\n"
-		"Date: %s\r\n"
-		"Content-Type: text/html; charset=utf-8\r\n"
-		"Content-Length: %d\r\n"
-		"%s"
-		"Connection: close\r\n"
-		"\r\n",
-		code, reason, date, blen,
-		code == 405 ? "Allow: GET, HEAD\r\n" : "");
-
-	if (blen < 0 || (size_t)blen >= sizeof(body) ||
-	    hlen < 0 || (size_t)hlen >= sizeof(head))
+	                "HTTP/1.1 %d %s\r\n"
+	                "Date: %s\r\n"
+	                "Content-Type: text/html; charset=utf-8\r\n"
+	                "Content-Length: %d\r\n"
+	                "%s"
+	                "Connection: close\r\n"
+	                "\r\n",
+	                code, reason, date, blen, code == 405 ? "Allow: GET, HEAD\r\n" : "");
+	if(blen < 0 || (size_t)blen >= sizeof(body) || hlen < 0 || (size_t)hlen >= sizeof(head)) {
 		return;
-	if (write_all(fd, head, hlen) == 0 && !head_only)
-		write_all(fd, body, blen);
+	}
+
+	if(write_all(fd, head, (size_t)hlen, !head_only) == 0 && !head_only) {
+		write_all(fd, body, (size_t)blen, false);
+	}
 }
 
-static int hexval(int c)
-{
-	if (c >= '0' && c <= '9')
+static int hexval(int c) {
+	if(c >= '0' && c <= '9') {
 		return c - '0';
-	if (c >= 'a' && c <= 'f')
+	}
+
+	if(c >= 'a' && c <= 'f') {
 		return c - 'a' + 10;
-	if (c >= 'A' && c <= 'F')
+	}
+
+	if(c >= 'A' && c <= 'F') {
 		return c - 'A' + 10;
+	}
+
 	return -1;
 }
 
-static int url_decode(const char *src, char *dst, size_t dstsz)
-{
+// the decoded length, -1 for a bad escape, an encoded nul or a path that does not fit
+static int url_decode(const char* src, char* dst, size_t dstsz) {
 	size_t i = 0;
 
-	for (; *src && *src != '?'; src++) {
+	for(; *src && *src != '?'; src++) {
 		int c = (unsigned char)*src;
 
-		if (c == '%') {
+		if(c == '%') {
 			int hi = hexval((unsigned char)src[1]);
 			int lo = hi < 0 ? -1 : hexval((unsigned char)src[2]);
-			if (lo < 0)
+
+			if(lo < 0) {
 				return -1;
+			}
+
 			c = hi << 4 | lo;
 			src += 2;
 		}
-		if (c == '\0' || i + 1 >= dstsz)
+
+		if(!c || i + 1 >= dstsz) {
 			return -1;
+		}
+
 		dst[i++] = (char)c;
 	}
+
 	dst[i] = '\0';
-	return 0;
+
+	return (int)i;
 }
 
-static int resolve_path(const char *root, const char *urlpath,
-                        char *out, size_t outsz)
-{
-	char joined[PATH_MAX], real[PATH_MAX];
-	size_t rootlen = strcmp(root, "/") ? strlen(root) : 0;
-	struct stat st;
-	int n, pass;
+// the regular file PATH names, index.html for a directory, PATH has room for the suffix
+static int open_doc(char* path, size_t len, struct stat* st) {
+	bool indexed = false;
 
-	if (urlpath[0] != '/')
-		return RESOLVE_FORBIDDEN;
+	for(;;) {
+		int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
 
-	n = snprintf(joined, sizeof(joined), "%.*s%s", (int)rootlen, root, urlpath);
-	if (n < 0 || (size_t)n >= sizeof(joined))
-		return RESOLVE_FORBIDDEN;
+		if(fd < 0) {
+			return -1;
+		}
 
-	for (pass = 0; pass < 2; pass++) {
-		if (!realpath(joined, real))
-			return RESOLVE_NOTFOUND;
-		if (strncmp(real, root, rootlen) ||
-		    (real[rootlen] && real[rootlen] != '/'))
-			return RESOLVE_FORBIDDEN;
-		if (stat(real, &st) < 0)
-			return RESOLVE_NOTFOUND;
-		if (S_ISREG(st.st_mode))
-			break;
-		if (!S_ISDIR(st.st_mode) || pass)
-			return RESOLVE_FORBIDDEN;
-		n = snprintf(joined, sizeof(joined), "%s/index.html", real);
-		if (n < 0 || (size_t)n >= sizeof(joined))
-			return RESOLVE_FORBIDDEN;
+		if(fstat(fd, st) < 0) {
+			close(fd);
+			return -1;
+		}
+
+		if(S_ISREG(st->st_mode)) {
+			return fd;
+		}
+
+		close(fd);
+		if(!S_ISDIR(st->st_mode) || indexed) {
+			errno = EACCES;
+			return -1;
+		}
+
+		memcpy(path + len, INDEX, sizeof(INDEX));
+		len += sizeof(INDEX) - 1;
+		indexed = true;
 	}
-
-	if ((size_t)snprintf(out, outsz, "%s", real) >= outsz)
-		return RESOLVE_FORBIDDEN;
-	return RESOLVE_OK;
 }
 
-static void send_file(int fd, const char *path, int head_only)
-{
-	char buf[IO_BUF], head[512], date[64];
-	struct stat st;
-	off_t left;
-	ssize_t r;
-	int ffd, hlen;
-
-	ffd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-	if (ffd < 0) {
-		send_error(fd, 403, "Forbidden", head_only);
-		return;
-	}
-	if (fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode)) {
-		close(ffd);
-		send_error(fd, 403, "Forbidden", head_only);
-		return;
-	}
+static void send_file(int cfd, int fd, const char* path, off_t size, bool head_only) {
+	char head[512], date[64];
+	off_t off = 0;
+	int hlen;
 
 	http_date(date, sizeof(date));
 	hlen = snprintf(head, sizeof(head),
-		"HTTP/1.1 200 OK\r\n"
-		"Date: %s\r\n"
-		"Content-Type: %s\r\n"
-		"Content-Length: %lld\r\n"
-		"Connection: close\r\n"
-		"\r\n",
-		date, mime_type(path), (long long)st.st_size);
-
-	if (hlen < 0 || (size_t)hlen >= sizeof(head)) {
-		close(ffd);
-		send_error(fd, 500, "Internal Server Error", head_only);
+	                "HTTP/1.1 200 OK\r\n"
+	                "Date: %s\r\n"
+	                "Content-Type: %s\r\n"
+	                "Content-Length: %lld\r\n"
+	                "Connection: close\r\n"
+	                "\r\n",
+	                date, mime_type(path), (long long)size);
+	if(hlen < 0 || (size_t)hlen >= sizeof(head)) {
+		send_error(cfd, 500, "Internal Server Error", head_only);
 		return;
 	}
 
-	if (write_all(fd, head, hlen) == 0 && !head_only) {
-		left = st.st_size;
-		while (left > 0) {
-			size_t want = sizeof(buf);
-
-			if ((off_t)want > left)
-				want = (size_t)left;
-			r = read(ffd, buf, want);
-			if (r < 0) {
-				if (errno == EINTR)
-					continue;
-				break;
-			}
-			if (r == 0)
-				break;
-			if (write_all(fd, buf, r) < 0)
-				break;
-			left -= r;
-		}
+	if(write_all(cfd, head, (size_t)hlen, !head_only) < 0 || head_only) {
+		return;
 	}
 
-	close(ffd);
+	while(off < size) {
+		ssize_t k = sendfile(cfd, fd, &off, (size_t)(size - off));
+
+		if(k < 0 && errno == EINTR) {
+			continue;
+		}
+
+		if(k <= 0) {
+			return;
+		}
+	}
 }
 
-static void handle_conn(int cfd, const char *root)
-{
-	char req[REQ_MAX], path[PATH_MAX], file[PATH_MAX];
-	char *method, *target, *sp;
+static void handle_conn(int cfd) {
+	char req[REQ_MAX], path[REQ_MAX + sizeof(INDEX)];
+	char* target;
+	char* sp;
+	struct stat st;
 	size_t len = 0;
-	ssize_t r;
-	int head_only;
+	bool head_only, gone;
+	int n, fd;
 
 	alarm(TIMEOUT);
+	for(;;) {
+		ssize_t r;
 
-	for (;;) {
-		if (len == sizeof(req) - 1) {
-			send_error(cfd, 431, "Request Header Fields Too Large", 0);
+		if(len == sizeof(req) - 1) {
+			send_error(cfd, 431, "Request Header Fields Too Large", false);
 			return;
 		}
+
 		r = read(cfd, req + len, sizeof(req) - 1 - len);
-		if (r < 0) {
-			if (errno == EINTR)
-				continue;
+		if(r < 0 && errno == EINTR) {
+			continue;
+		}
+
+		if(r < 0) {
 			return;
 		}
-		if (r == 0) {
-			if (len)
-				send_error(cfd, 400, "Bad Request", 0);
+
+		if(!r) {
+			if(len) {
+				send_error(cfd, 400, "Bad Request", false);
+			}
+
 			return;
 		}
-		len += r;
+
+		len += (size_t)r;
 		req[len] = '\0';
-		if (strstr(req, "\r\n\r\n") || strstr(req, "\n\n"))
+		if(strstr(req, "\r\n\r\n") || strstr(req, "\n\n")) {
 			break;
+		}
 	}
 
 	alarm(0);
-
-	method = req;
-	sp = strchr(req, ' ');
-	if (!sp) {
-		send_error(cfd, 400, "Bad Request", 0);
+	target = strchr(req, ' ');
+	sp = target ? strchr(target + 1, ' ') : nullptr;
+	if(!sp) {
+		send_error(cfd, 400, "Bad Request", false);
 		return;
 	}
+
+	*target++ = '\0';
 	*sp = '\0';
-	target = sp + 1;
-	sp = strchr(target, ' ');
-	if (!sp) {
-		send_error(cfd, 400, "Bad Request", 0);
-		return;
-	}
-	*sp = '\0';
-
-	head_only = !strcmp(method, "HEAD");
-	if (!head_only && strcmp(method, "GET")) {
-		send_error(cfd, 405, "Method Not Allowed", 0);
+	head_only = !strcmp(req, "HEAD");
+	if(!head_only && strcmp(req, "GET")) {
+		send_error(cfd, 405, "Method Not Allowed", false);
 		return;
 	}
 
-	if (url_decode(target, path, sizeof(path)) < 0) {
+	n = *target == '/' ? url_decode(target, path, REQ_MAX) : -1;
+	if(n < 0) {
 		send_error(cfd, 400, "Bad Request", head_only);
 		return;
 	}
 
-	switch (resolve_path(root, path, file, sizeof(file))) {
-	case RESOLVE_OK:
-		send_file(cfd, file, head_only);
-		break;
-	case RESOLVE_FORBIDDEN:
-		send_error(cfd, 403, "Forbidden", head_only);
-		break;
-	default:
-		send_error(cfd, 404, "Not Found", head_only);
+	fd = open_doc(path, (size_t)n, &st);
+	if(fd < 0) {
+		gone = errno == ENOENT || errno == ENOTDIR || errno == ENAMETOOLONG || errno == ELOOP;
+		send_error(cfd, gone ? 404 : 403, gone ? "Not Found" : "Forbidden", head_only);
+		return;
 	}
+
+	send_file(cfd, fd, path, st.st_size, head_only);
+	close(fd);
 }
 
-static void close_conn(int fd)
-{
+static void close_conn(int fd) {
 	char buf[4096];
 
 	alarm(TIMEOUT);
 	shutdown(fd, SHUT_WR);
-	while (read(fd, buf, sizeof(buf)) > 0)
+	while(read(fd, buf, sizeof(buf)) > 0)
 		;
 	close(fd);
 }
 
-static int reap(int nchild, int block)
-{
-	while (nchild > 0) {
-		pid_t p = waitpid(-1, NULL, block ? 0 : WNOHANG);
+static int reap(int nchild, bool block) {
+	while(nchild > 0) {
+		pid_t p = waitpid(-1, nullptr, block ? 0 : WNOHANG);
 
-		if (p < 0 && errno == ECHILD)
+		if(p < 0 && errno == ECHILD) {
 			return 0;
-		if (p <= 0)
+		}
+
+		if(p <= 0) {
 			break;
+		}
+
 		nchild--;
-		block = 0;
+		block = false;
 	}
+
 	return nchild;
 }
 
-static int listen_on(int port)
-{
-	struct sockaddr_in addr;
+static int listen_on(uint16_t port) {
+	struct sockaddr_in addr = { 0 };
 	int fd, on = 1;
 
-	fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0)
-		die("socket");
-	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
-		die("setsockopt");
+	fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if(fd < 0) {
+		die("socket", nullptr);
+	}
 
-	memset(&addr, 0, sizeof(addr));
+	if(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+		die("setsockopt", nullptr);
+	}
+
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	addr.sin_port = htons(port);
+	if(bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+		die("bind", nullptr);
+	}
 
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-		die("bind");
-	if (listen(fd, BACKLOG) < 0)
-		die("listen");
+	if(listen(fd, BACKLOG) < 0) {
+		die("listen", nullptr);
+	}
 
 	return fd;
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char** argv) {
 	struct timeval tv = { TIMEOUT, 0 };
 	char root[PATH_MAX];
-	struct stat st;
+	struct passwd* pw;
 	int lfd, nchild = 0;
 
-	if (argc != 2) {
-		fprintf(stderr, "usage: %s <docroot>\n", argc ? argv[0] : "nhttp");
-		return 1;
+	if(argc > 1 && !strcmp(argv[1], "--help")) {
+		usage(stdout);
+		return 0;
+	}
+
+	if(argc > 1 && argv[1][0] == '-' && argv[1][1]) {
+		fprintf(stderr, "nhttp: unrecognized option '%s'\n", argv[1]);
+		usage(stderr);
+		return 2;
+	}
+
+	if(argc != 2) {
+		fprintf(stderr, argc < 2 ? "nhttp: missing operand\n" : "nhttp: extra operand '%s'\n", argv[2]);
+		usage(stderr);
+		return 2;
 	}
 
 	signal(SIGPIPE, SIG_IGN);
+	if(!realpath(argv[1], root)) {
+		die("realpath", argv[1]);
+	}
 
-	if (!realpath(argv[1], root))
-		die(argv[1]);
-	if (stat(root, &st) < 0)
-		die(root);
-	if (!S_ISDIR(st.st_mode)) {
-		fprintf(stderr, "nhttp: %s: not a directory\n", root);
+	// the user lookup reads /etc/passwd, the chroot below takes that away
+	errno = 0;
+	pw = getpwnam(USER);
+	if(!pw) {
+		if(errno) {
+			die("getpwnam", USER);
+		}
+
+		fprintf(stderr, "nhttp: user " USER " does not exist\n");
+		return 1;
+	}
+
+	if(!pw->pw_uid) {
+		fprintf(stderr, "nhttp: user " USER " has uid 0\n");
 		return 1;
 	}
 
 	lfd = listen_on(PORT);
-	fprintf(stderr, "nhttp: serving %s on port %d\n", root, PORT);
+	if(chroot(root) < 0) {
+		die("chroot", root);
+	}
 
-	for (;;) {
-		int cfd = accept(lfd, NULL, NULL);
+	if(chdir("/") < 0) {
+		die("chdir", "/");
+	}
+
+	if(setgroups(0, nullptr) < 0) {
+		die("setgroups", nullptr);
+	}
+
+	if(setgid(pw->pw_gid) < 0) {
+		die("setgid", nullptr);
+	}
+
+	if(setuid(pw->pw_uid) < 0) {
+		die("setuid", nullptr);
+	}
+
+	fprintf(stderr, "nhttp: serving %s on port %d as %s\n", root, PORT, USER);
+	for(;;) {
+		int cfd = accept(lfd, nullptr, nullptr);
 		pid_t pid;
 
-		if (cfd < 0) {
-			if (errno == EINTR || errno == ECONNABORTED)
-				continue;
-			if (errno == EMFILE || errno == ENFILE ||
-			    errno == ENOBUFS || errno == ENOMEM) {
-				if (nchild)
-					nchild = reap(nchild, 1);
-				else
-					sleep(1);
+		if(cfd < 0) {
+			if(errno == EINTR || errno == ECONNABORTED) {
 				continue;
 			}
-			die("accept");
+
+			if(errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+				if(nchild) {
+					nchild = reap(nchild, true);
+				} else {
+					sleep(1);
+				}
+
+				continue;
+			}
+
+			die("accept", nullptr);
 		}
 
 		setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 		setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-		nchild = reap(nchild, 0);
-		if (nchild >= CONN_MAX)
-			nchild = reap(nchild, 1);
+		nchild = reap(nchild, false);
+		if(nchild >= CONN_MAX) {
+			nchild = reap(nchild, true);
+		}
 
 		pid = fork();
-		if (pid < 0) {
-			send_error(cfd, 503, "Service Unavailable", 0);
+		if(pid < 0) {
+			send_error(cfd, 503, "Service Unavailable", false);
 			close(cfd);
 			continue;
 		}
-		if (pid == 0) {
+
+		if(!pid) {
 			close(lfd);
-			handle_conn(cfd, root);
+			handle_conn(cfd);
 			close_conn(cfd);
 			_exit(0);
 		}
+
 		nchild++;
 		close(cfd);
 	}
